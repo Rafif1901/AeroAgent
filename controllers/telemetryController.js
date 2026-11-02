@@ -1,26 +1,39 @@
 const Telemetry = require('../models/Telemetry');
 
-// @desc    Ingest data sensor polusi baru (Bucket Pattern)
+// @desc    Ingest data sensor polusi, cuaca & kejadian eksternal (Agent 1 - Data Collector)
 // @route   POST /api/telemetry
 const addTelemetryData = async (req, res) => {
     try {
-        const { stationId, pm25, pm10, co } = req.body;
+        const { 
+            stationId, 
+            locationName, 
+            pm25, 
+            pm10, 
+            co, 
+            temperature, 
+            humidity, 
+            windSpeed, 
+            externalEvent 
+        } = req.body;
 
         const now = new Date();
-        // timestamp bucket (YYYY-MM-DD 00:00:00 UTC)
         const bucketDate = new Date(Date.UTC(now.getFullYear(), now.getMonth(), now.getDate()));
 
         const readingData = {
             timestamp: now,
             pm25,
             pm10,
-            co
+            co,
+            temperature: temperature ?? 25.0,
+            humidity: humidity ?? 80.0,
+            windSpeed: windSpeed ?? 2.1,
+            externalEvent: externalEvent || 'None'
         };
 
-        // update or create new (upsert)
         const updatedBucket = await Telemetry.findOneAndUpdate(
             { stationId, bucketDate },
             {
+                $set: { locationName: locationName || stationId },
                 $inc: { count: 1 },
                 $push: { readings: readingData }
             },
@@ -29,7 +42,7 @@ const addTelemetryData = async (req, res) => {
 
         res.status(201).json({
             success: true,
-            message: 'telemetry data successfully stored on MongoDB Atlas',
+            message: 'Telemetry data successfully stored on MongoDB Atlas',
             data: updatedBucket
         });
     } catch (error) {
@@ -37,6 +50,8 @@ const addTelemetryData = async (req, res) => {
     }
 };
 
+// @desc    Ambil riwayat telemetri per stasiun
+// @route   GET /api/telemetry/:stationId
 const getTelemetryByStation = async (req, res) => {
     try {
         const { stationId } = req.params;
