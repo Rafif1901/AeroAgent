@@ -1,68 +1,92 @@
 const Telemetry = require('../models/Telemetry');
 const { pool } = require('../config/pg');
+const { GoogleGenerativeAI } = require('@google/generative-ai');
 
-// @desc    Jalankan analisis Agent 2, 3, dan 4 untuk suatu stasiun/area
+const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+
+// @desc    Jalankan analisis Agent 2, 3, dan 4 menggunakan Gemini AI
 // @route   POST /api/dashboard/analyze
 const analyzeAndEscalate = async (req, res) => {
     try {
-        const { 
+        let { 
             stationId, 
             locationName, 
             pm25, 
             pm10, 
             co, 
-            affectedArea = 5.0, // dalam km2
-            pollutionSource = 'Vehicle & Industrial Emissions' 
+            so2 = 0,
+            no2 = 0,
+            o3 = 0,
+            affectedArea = 5.0, 
+            pollutionSource = 'Urban Traffic & Industrial Activity' 
         } = req.body;
 
-        if (!stationId || pm25 === undefined) {
+        if (!stationId) {
             return res.status(400).json({
                 success: false,
-                message: 'stationId and pm25 are required for Priority Analysis'
+                message: 'stationId is required for Priority Analysis'
             });
         }
 
-        // --- AGENT 2: PRIORITY ANALYZER ---
-        // Hitung skor keparahan (Severity Score) berdasarkan polutan utama
-        const severityScore = Number(((pm25 * 0.6) + ((pm10 || 0) * 0.25) + ((co || 0) * 1.5)).toFixed(2));
-        
-        // Bobot sumber polusi (Volcanic Ash mendapat bobot prioritas lebih tinggi sesuai Bab 1.2)
-        const sourceMultiplier = pollutionSource.toLowerCase().includes('volcanic') || pollutionSource.toLowerCase().includes('krakatau') ? 1.35 : 1.0;
-
-        // Rumus Priority Index (skala 0 - 100+)
-        const priorityIndex = Number(
-            ((severityScore * 0.7 + affectedArea * 2.5) * sourceMultiplier).toFixed(2)
-        );
-
-        // --- AGENT 4: ESCALATION AGENT ---
-        // Klasifikasi 3 Level Urgensi: Monitoring, Attention, High Risk
-        let urgencyLevel = 'Level 1 - Monitoring';
-        let warningMessage = `Kondisi udara di ${locationName || stationId} dalam pemantauan rutin.`;
-
-        if (priorityIndex >= 75) {
-            urgencyLevel = 'Level 3 - High Risk';
-            warningMessage = `PERINGATAN TINGGI: Indeks Prioritas mencapai ${priorityIndex} di ${locationName || stationId} akibat ${pollutionSource}. Eskalasi darurat diperlukan segera!`;
-        } else if (priorityIndex >= 45) {
-            urgencyLevel = 'Level 2 - Attention';
-            warningMessage = `PERHATIAN: Peningkatan polutan signifikan (Priority Index: ${priorityIndex}) di ${locationName || stationId}.`;
+        // Jika nilai pm25 tidak dikirim di body, ambil otomatis dari data ISPU terbaru di MongoDB
+        if (pm25 === undefined) {
+            const latestBucket = await Telemetry.findOne({ stationId }).sort({ bucketDate: -1 });
+            if (!latestBucket || latestBucket.readings.length === 0) {
+                return res.status(404).json({
+                    success: false,
+                    message: `Data telemetri untuk stasiun ${stationId} belum ditemukan di database. Jalankan sync-ispu terlebih dahulu atau kirimkan parameter pm25.`
+                });
+            }
+            const latestReading = latestBucket.readings[latestBucket.readings.length - 1];
+            locationName = locationName || latestBucket.locationName;
+            pm25 = latestReading.pm25;
+            pm10 = latestReading.pm10;
+            co = latestReading.co;
+            so2 = latestReading.so2 || 0;
+            no2 = latestReading.no2 || 0;
+            o3 = latestReading.o3 || 0;
+            if (latestReading.externalEvent && latestReading.externalEvent !== 'Normal') {
+                pollutionSource = latestReading.externalEvent;
+            }
         }
 
-        // --- AGENT 3: TASK DISPATCHER ---
-        let targetInstitution = 'Dinas Lingkungan Hidup (DLH) DKI Jakarta';
-        let recommendedAction = 'Lakukan pemantauan berkala pada SPKU setempat.';
+        // Inisialisasi model Gemini dengan paksaan output JSON terstruktur
+        const model = genAI.getGenerativeModel({
+            model: 'gemini-3.8-flash',
+            generationConfig: {
+                responseMimeType: 'application/json'
+            }
+        });
 
-        if (pollutionSource.toLowerCase().includes('volcanic') || pollutionSource.toLowerCase().includes('krakatau')) {
-            targetInstitution = 'BPBD DKI Jakarta & Dinas Kesehatan';
-            recommendedAction = 'Distribusikan masker respirator N95 ke warga terdampak, aktifkan peringatan debu vulkanik, dan siagakan fasilitas kesehatan.';
-        } else if (priorityIndex >= 75) {
-            targetInstitution = 'DLH DKI Jakarta & Dinas Perhubungan (Dishub)';
-            recommendedAction = 'Terapkan rekayasa lalu lintas/pembatasan kendaraan di area kritis, lakukan penyemprotan air jalanan (water mist), dan inspeksi emisi industri sekitar.';
-        } else if (priorityIndex >= 45) {
-            targetInstitution = 'Dinas Lingkungan Hidup (DLH) DKI Jakarta';
-            recommendedAction = 'Tingkatkan frekuensi uji emisi kendaraan dan berikan imbauan pembatasan aktivitas luar ruangan bagi kelompok sensitif.';
-        }
+        const prompt = `
+Anda adalah inti kecerdasan buatan AeroAgent untuk Pemerintah Provinsi DKI Jakarta yang menjalankan 3 Agen secara berurutan:
+1. Agent 2 (Priority Analyzer): Analisis tingkat keparahan polutan (severity_score skala 0-100) dan hitung priority_index (skala 0-100) dengan mempertimbangkan konsentrasi polutan, luas area terdampak (affectedArea), dan bahaya sumber polusi (terutama jika ada kejadian eksternal seperti abu vulkanik Gunung Anak Krakatau atau kebakaran).
+2. Agent 3 (Task Dispatcher): Tentukan instansi pemerintah DKI Jakarta yang paling relevan (target_institution) dan buat rekomendasi tindakan lapangan yang spesifik, taktis, dan kontekstual (recommended_action).
+3. Agent 4 (Escalation Agent): Tentukan level urgensi (urgency_level) yang WAJIB bernilai salah satu dari tiga opsi ini: "Level 1 - Monitoring", "Level 2 - Attention", atau "Level 3 - High Risk", serta buat pesan peringatan dini (warning_message).
 
-        // Simpan log ke PostgreSQL
+Data Lingkungan Saat Ini:
+- Stasiun SPKU: ${stationId} (${locationName || stationId})
+- PM2.5: ${pm25} µg/m³
+- PM10: ${pm10 || 0} µg/m³
+- CO: ${co || 0}
+- SO2: ${so2} | NO2: ${no2} | O3: ${o3}
+- Luas Area Terdampak: ${affectedArea} km²
+- Indikasi Sumber Polusi / Kejadian Eksternal: ${pollutionSource}
+
+Kembalikan respons HANYA dalam format JSON dengan struktur key berikut:
+{
+  "severity_score": <number>,
+  "priority_index": <number>,
+  "urgency_level": "<Level 1 - Monitoring | Level 2 - Attention | Level 3 - High Risk>",
+  "target_institution": "<string nama instansi terkait>",
+  "recommended_action": "<string rekomendasi kebijakan/tindakan konkret>",
+  "warning_message": "<string ringkasan peringatan dini>"
+}`;
+
+        const result = await model.generateContent(prompt);
+        const aiDecision = JSON.parse(result.response.text());
+
+        // Simpan keputusan Agentic AI ke PostgreSQL
         const savedLog = await pool.query(
             `INSERT INTO warning_logs 
             (station_id, location_name, severity_score, affected_area, pollution_source, priority_index, urgency_level, target_institution, recommended_action, warning_message) 
@@ -71,20 +95,20 @@ const analyzeAndEscalate = async (req, res) => {
             [
                 stationId,
                 locationName || stationId,
-                severityScore,
+                Number(aiDecision.severity_score),
                 affectedArea,
                 pollutionSource,
-                priorityIndex,
-                urgencyLevel,
-                targetInstitution,
-                recommendedAction,
-                warningMessage
+                Number(aiDecision.priority_index),
+                aiDecision.urgency_level,
+                aiDecision.target_institution,
+                aiDecision.recommended_action,
+                aiDecision.warning_message
             ]
         );
 
         res.status(201).json({
             success: true,
-            message: 'Agentic AI analysis and escalation completed',
+            message: 'Dynamic Agentic AI (Agents 2, 3, 4) analysis completed via Gemini',
             disclaimer: 'AeroAgent is a decision-support tool. Automated task dispatches require human-in-the-loop validation before physical deployment.',
             data: savedLog.rows[0]
         });
@@ -97,19 +121,16 @@ const analyzeAndEscalate = async (req, res) => {
 // @route   GET /api/dashboard/overview
 const getDashboardOverview = async (req, res) => {
     try {
-        // 1. Ambil 20 log peringatan & Priority Index terbaru dari PostgreSQL
         const warningsResult = await pool.query(
             'SELECT * FROM warning_logs ORDER BY created_at DESC LIMIT 20'
         );
 
-        // 2. Ambil data telemetri terbaru dari setiap stasiun di MongoDB untuk Heatmap
         const buckets = await Telemetry.find().sort({ bucketDate: -1 });
         const stationMap = new Map();
 
         for (const bucket of buckets) {
             if (!stationMap.has(bucket.stationId) && bucket.readings.length > 0) {
                 const latestReading = bucket.readings[bucket.readings.length - 1];
-                // Estimasi nilai AQI sederhana dari PM2.5
                 const aqi = Math.round(latestReading.pm25 * 2.1);
                 stationMap.set(bucket.stationId, {
                     stationId: bucket.stationId,
